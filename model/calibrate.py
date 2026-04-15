@@ -179,7 +179,7 @@ def print_reliability_curve(
     print("=" * w)
     print("  Reliability Curve — Ensemble (raw) vs Calibrated")
     print("=" * w)
-    print(f"  {'Bin centre':>10}  {'Raw freq':>10}  {'Cal freq':>10}  {'Δ raw':>8}  {'Δ cal':>8}")
+    print(f"  {'Bin centre':>10}  {'Raw freq':>10}  {'Cal freq':>10}  {'d_raw':>8}  {'d_cal':>8}")
     print(f"  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}  {'-'*8}")
 
     max_len = max(len(frac_pos_raw), len(frac_pos_cal))
@@ -189,14 +189,14 @@ def print_reliability_curve(
             fr = f"{frac_pos_raw[i]:.3f}"
             d_raw = f"{frac_pos_raw[i] - mean_pred_raw[i]:+.3f}"
         else:
-            ctr_raw = fr = d_raw = "—"
+            ctr_raw = fr = d_raw = "N/A"
 
         if i < len(frac_pos_cal):
             ctr_cal = f"{mean_pred_cal[i]:.2f}"
             fc = f"{frac_pos_cal[i]:.3f}"
             d_cal = f"{frac_pos_cal[i] - mean_pred_cal[i]:+.3f}"
         else:
-            fc = d_cal = "—"
+            fc = d_cal = "N/A"
 
         print(f"  {ctr_raw:>10}  {fr:>10}  {fc:>10}  {d_raw:>8}  {d_cal:>8}")
 
