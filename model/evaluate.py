@@ -486,6 +486,7 @@ def print_model_comparison(
         ("Simple average (0.5/0.5)", "ensemble_simple"),
         ("Stacked (logistic)", "ensemble_stacked"),
         ("Calibrated ensemble", "calibrated_proba"),
+        ("Stacked + holdout cal", "stacked_cal_proba"),
     ]
 
     w = 66

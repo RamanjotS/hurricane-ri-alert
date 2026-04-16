@@ -53,8 +53,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.scripts.build_training_data import ALL_FEATURE_COLUMNS  # noqa: E402
-from data.scripts.fetch_goes16 import GOES_FEATURE_COLUMNS  # noqa: E402
+from data.scripts.build_training_data import (  # noqa: E402
+    ALL_FEATURE_COLUMNS,
+    GOES_FEATURE_COLUMNS,
+)
 
 # ---------------------------------------------------------------------------
 # Paths & constants
@@ -67,8 +69,9 @@ GOES16_FEATURES_PATH = PROCESSED_DIR / "goes16_features.parquet"
 ARTIFACTS_DIR = REPO_ROOT / "model" / "artifacts"
 TEST_PREDS_PATH = ARTIFACTS_DIR / "lstm_test_preds.parquet"
 
-# All feature columns used by the LSTM (SHIPS + engineered + GOES-16)
-LSTM_FEATURE_COLUMNS: list[str] = ALL_FEATURE_COLUMNS + GOES_FEATURE_COLUMNS
+# ALL_FEATURE_COLUMNS already includes GOES-16 features (added by build_training_data.py).
+# LSTM uses the full 16-feature set.
+LSTM_FEATURE_COLUMNS: list[str] = ALL_FEATURE_COLUMNS
 
 # Sequence length: 8 steps × 6-hourly = 48-hour rolling window
 SEQ_LEN: int = 8
@@ -129,29 +132,44 @@ def load_and_join(
         f"RI rate {df['ri_label'].mean() * 100:.1f}%"
     )
 
-    if goes_path.exists():
-        logger.info(f"Loading {goes_path.name} …")
-        goes_df = pd.read_parquet(goes_path)
-        df = pd.merge(df, goes_df, on=["storm_id", "datetime"], how="left")
-        n_nan = df[GOES_FEATURE_COLUMNS].isna().all(axis=1).sum()
-        logger.info(
-            f"  GOES-16 join: {len(goes_df):,} rows merged | "
-            f"{n_nan:,} rows with all-NaN GOES features (pre-2018 or missing)"
+    # GOES-16 features are already merged into training_data.parquet by
+    # build_training_data.py.  Only fall back to a separate join if they are
+    # somehow absent (e.g. old parquet built before the GOES update).
+    goes_missing = [c for c in GOES_FEATURE_COLUMNS if c not in df.columns]
+    if goes_missing and goes_path.exists():
+        logger.warning(
+            "GOES-16 columns missing from training_data — doing late join from "
+            f"{goes_path.name} …"
         )
-        # Impute GOES NaNs with column medians from GOES-era rows only
+        goes_df = pd.read_parquet(goes_path)
+        goes_df["datetime"] = pd.to_datetime(goes_df["datetime"])
+        if goes_df["datetime"].dt.tz is not None:
+            goes_df["datetime"] = goes_df["datetime"].dt.tz_localize(None)
+        df = pd.merge(df, goes_df, on=["storm_id", "datetime"], how="left")
+        # Impute with GOES-era medians
         goes_era_mask = df[GOES_FEATURE_COLUMNS[0]].notna()
         for col in GOES_FEATURE_COLUMNS:
             if df[col].isna().any():
                 fill_val = float(df.loc[goes_era_mask, col].median())
                 df[col] = df[col].fillna(fill_val)
-        feature_cols = LSTM_FEATURE_COLUMNS
-    else:
+    elif goes_missing:
         logger.warning(
-            f"{goes_path.name} not found — falling back to SHIPS features only. "
-            "Run fetch_goes16.py to add satellite features."
+            f"{goes_path.name} not found and GOES columns absent from "
+            "training_data — GOES features will use imputed medians (0.0). "
+            "Run fetch_goes16.py + build_training_data.py to add satellite features."
         )
-        feature_cols = ALL_FEATURE_COLUMNS
+        for col in goes_missing:
+            df[col] = np.float32(0.0)
+    else:
+        n_nan = int(df[GOES_FEATURE_COLUMNS].isna().any(axis=1).sum())
+        if n_nan:
+            logger.warning(f"  {n_nan:,} rows still have NaN GOES features after load — check imputation.")
+        logger.info(
+            f"  GOES-16 features present in training_data "
+            f"({len(GOES_FEATURE_COLUMNS)} columns)"
+        )
 
+    feature_cols = LSTM_FEATURE_COLUMNS
     logger.info(f"Feature columns: {len(feature_cols)}")
     return df, feature_cols
 

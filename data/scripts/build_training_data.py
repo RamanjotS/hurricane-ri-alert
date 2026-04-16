@@ -52,6 +52,7 @@ PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
 HURDAT2_LABELED_PATH = PROCESSED_DIR / "hurdat2_labeled.parquet"
 SHIPS_CLEAN_PATH = PROCESSED_DIR / "ships_clean.parquet"
+GOES16_FEATURES_PATH = PROCESSED_DIR / "goes16_features.parquet"
 OUTPUT_PATH = PROCESSED_DIR / "training_data.parquet"
 
 ARTIFACTS_DIR = REPO_ROOT / "model" / "artifacts"
@@ -69,13 +70,23 @@ SHIPS_FEATURE_COLUMNS: list[str] = [
     "VVAV",
 ]
 
-# All model-input feature columns (SHIPS + engineered).
+# The 5 GOES-16 derived brightness-temperature features.
+# Mirrors GOES_FEATURE_COLUMNS in fetch_goes16.py — must stay in sync.
+GOES_FEATURE_COLUMNS: list[str] = [
+    "std_bt",
+    "area_deep_conv",
+    "min_bt",
+    "sym_index",
+    "ot_count",
+]
+
+# All model-input feature columns (SHIPS + engineered + GOES-16).
 # This exact list must be imported by feature_builder.py and train scripts.
 ALL_FEATURE_COLUMNS: list[str] = SHIPS_FEATURE_COLUMNS + [
     "wind_change_6h",
     "hours_since_ts",
     "intensity_pct_vmpi",
-]
+] + GOES_FEATURE_COLUMNS
 
 # Quality filter threshold: drop row if strictly more than this many SHIPS
 # feature columns are null.
@@ -160,6 +171,62 @@ def inner_join(h2: pd.DataFrame, ships: pd.DataFrame) -> pd.DataFrame:
         f"({len(merged) / n_before_h2 * 100:.1f}% of HURDAT2 retained)"
     )
     return merged
+
+
+# ---------------------------------------------------------------------------
+# GOES-16 feature join
+# ---------------------------------------------------------------------------
+
+
+def join_goes16_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Left-join GOES-16 brightness-temperature features into the training frame.
+
+    If goes16_features.parquet exists, the 5 GOES_FEATURE_COLUMNS are added via
+    a left join on (storm_id, datetime).  Pre-2018 rows (and any 2018+ rows where
+    no GOES scan was found) receive NaN, which is later filled by
+    ``impute_and_save_medians`` using the median of the GOES-era rows.
+
+    If the file is absent all GOES columns are set to NaN and a warning is logged.
+    The pipeline continues normally; GOES features will be imputed to 0.0 (the
+    fallback when the entire column is NaN).
+
+    Args:
+        df: Merged HURDAT2 + SHIPS DataFrame.
+
+    Returns:
+        DataFrame with GOES_FEATURE_COLUMNS appended.
+    """
+    if not GOES16_FEATURES_PATH.exists():
+        logger.warning(
+            f"{GOES16_FEATURES_PATH.name} not found — GOES-16 features will be "
+            "all-NaN (imputed to 0.0). Run data/scripts/fetch_goes16.py to add "
+            "satellite features."
+        )
+        for col in GOES_FEATURE_COLUMNS:
+            df[col] = np.float32("nan")
+        return df
+
+    logger.info(f"Loading {GOES16_FEATURES_PATH.name} …")
+    goes_df = pd.read_parquet(
+        GOES16_FEATURES_PATH,
+        columns=["storm_id", "datetime"] + GOES_FEATURE_COLUMNS,
+    )
+
+    # Normalise timezones — goes16_features has UTC-aware datetimes; training
+    # frame has naive datetimes.  Strip timezone before merging.
+    goes_df["datetime"] = pd.to_datetime(goes_df["datetime"])
+    if goes_df["datetime"].dt.tz is not None:
+        goes_df["datetime"] = goes_df["datetime"].dt.tz_localize(None)
+
+    df = pd.merge(df, goes_df, on=["storm_id", "datetime"], how="left")
+
+    n_goes = int(df[GOES_FEATURE_COLUMNS[0]].notna().sum())
+    n_nan  = len(df) - n_goes
+    logger.info(
+        f"  GOES-16 join: {n_goes:,} rows with satellite features | "
+        f"{n_nan:,} pre-2018 / missing rows (will be imputed)"
+    )
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +435,9 @@ def impute_and_save_medians(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in ALL_FEATURE_COLUMNS:
         median_val = float(df[col].median())
+        # Guard against all-NaN columns (e.g. GOES features when file is absent)
+        if np.isnan(median_val):
+            median_val = 0.0
         medians[col] = median_val
         if df[col].isna().any():
             df[col] = df[col].fillna(median_val)
@@ -429,7 +499,7 @@ def print_summary(df: pd.DataFrame) -> None:
     # Null counts across all columns — highlight any non-zero
     print(f"  {'Column':<22}  {'Nulls':>8}")
     print(f"  {'-'*22}  {'-'*8}")
-    all_cols = ALL_FEATURE_COLUMNS + ["ri_label", "wind_change_24h"]
+    all_cols = ALL_FEATURE_COLUMNS + ["ri_label"]
     for col in all_cols:
         nulls = int(df[col].isna().sum()) if col in df.columns else -1
         flag = "  ← WARNING" if nulls > 0 else ""
@@ -464,6 +534,7 @@ def build_training_data(
     h2, ships = load_inputs()
 
     df = inner_join(h2, ships)
+    df = join_goes16_features(df)
     df = engineer_features(df)
     df = apply_quality_filters(df)
     df = impute_and_save_medians(df)
