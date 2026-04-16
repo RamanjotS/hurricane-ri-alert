@@ -33,6 +33,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import pickle
 import shutil
 import sys
@@ -68,6 +69,11 @@ TEST_PREDS_PATH = ARTIFACTS_DIR / "xgb_test_preds.parquet"
 
 # Temporal split: test set covers storms first observed in [TEST_YEAR, 2023]
 TEST_YEAR: int = 2018
+
+# GOES-era-only mode: restrict training to storms first observed in
+# [GOES_ERA_TRAIN_START, GOES_ERA_TEST_YEAR) and test on GOES_ERA_TEST_YEAR+
+GOES_ERA_TRAIN_START: int = 2018
+GOES_ERA_TEST_YEAR: int = 2023
 
 # Fraction of training-pool rows (by time) held out for early-stopping validation
 VAL_FRAC: float = 0.15
@@ -144,23 +150,30 @@ def temporal_split(
     df: pd.DataFrame,
     test_year: int = TEST_YEAR,
     val_frac: float = VAL_FRAC,
+    goes_era_only: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split the dataset into train, validation, and test by storm first-obs year.
 
     Splitting strategy:
       1. Compute each storm's first observation year.
       2. Storms first seen before ``test_year`` → training pool.
-         Storms first seen in [test_year, 2023]  → test set.
+         Storms first seen in [test_year, ...]  → test set.
       3. Within the training pool, rows in the last ``val_frac`` fraction of time
          become the validation set (used only for early stopping).
+
+    When ``goes_era_only=True`` the split is restricted to GOES-era storms:
+      - Training pool: storms first observed in [GOES_ERA_TRAIN_START, GOES_ERA_TEST_YEAR)
+      - Test set:      storms first observed >= GOES_ERA_TEST_YEAR
 
     All rows for a given storm go to the same partition, preventing the look-ahead
     bias that arises when the same storm has rows in both train and test.
 
     Args:
-        df:        Full training DataFrame (already filtered to 1982–2023).
-        test_year: First year (inclusive) of the held-out test window.
-        val_frac:  Fraction of training-pool rows by time reserved for validation.
+        df:             Full training DataFrame.
+        test_year:      First year (inclusive) of the held-out test window.
+                        Ignored when goes_era_only=True.
+        val_frac:       Fraction of training-pool rows by time reserved for validation.
+        goes_era_only:  If True, restrict to GOES-16 operational era (2018+).
 
     Returns:
         Tuple of (train_df, val_df, test_df) DataFrames.
@@ -170,8 +183,17 @@ def temporal_split(
         df.groupby("storm_id")["datetime"].min().dt.year
     )
 
-    train_pool_storms = storm_first_year[storm_first_year < test_year].index
-    test_storms = storm_first_year[storm_first_year >= test_year].index
+    if goes_era_only:
+        train_pool_storms = storm_first_year[
+            (storm_first_year >= GOES_ERA_TRAIN_START)
+            & (storm_first_year < GOES_ERA_TEST_YEAR)
+        ].index
+        test_storms = storm_first_year[
+            storm_first_year >= GOES_ERA_TEST_YEAR
+        ].index
+    else:
+        train_pool_storms = storm_first_year[storm_first_year < test_year].index
+        test_storms = storm_first_year[storm_first_year >= test_year].index
 
     train_pool = df[df["storm_id"].isin(train_pool_storms)].copy()
     test_df = df[df["storm_id"].isin(test_storms)].copy()
@@ -408,6 +430,7 @@ def evaluate(
     X_test: np.ndarray,
     y_test: np.ndarray,
     y_train: np.ndarray,
+    era_label: str = "2018–2023",
 ) -> dict[str, float]:
     """Run the full evaluation suite on the held-out test set.
 
@@ -419,10 +442,11 @@ def evaluate(
       - Feature importance table (top TOP_N_FEATURES by gain)
 
     Args:
-        model:   Trained XGBClassifier.
-        X_test:  Test feature matrix.
-        y_test:  Test labels.
-        y_train: Training labels (used for climatological BSS baseline).
+        model:      Trained XGBClassifier.
+        X_test:     Test feature matrix.
+        y_test:     Test labels.
+        y_train:    Training labels (used for climatological BSS baseline).
+        era_label:  Year range string shown in the report header.
 
     Returns:
         Dict mapping metric name to float value.
@@ -451,7 +475,7 @@ def evaluate(
 
     print()
     print("=" * w)
-    print("  XGBoost RI Model — Test-Set Evaluation (2018–2023)")
+    print(f"  XGBoost RI Model — Test-Set Evaluation ({era_label})")
     print("=" * w)
     print(f"  Test observations   : {len(y_test):,}")
     print(f"  RI events in test   : {int(y_test.sum()):,}  "
@@ -567,6 +591,7 @@ def save_artifacts(
 
 def train_xgboost(
     data_path: Path = TRAINING_DATA_PATH,
+    goes_era_only: bool = False,
 ) -> xgb.XGBClassifier:
     """Run the full XGBoost training pipeline end-to-end.
 
@@ -576,18 +601,26 @@ def train_xgboost(
       3. Build NumPy feature matrices.
       4. Compute scale_pos_weight from training set.
       5. Train XGBClassifier with early stopping.
-      6. Evaluate on held-out test set (2018–2023).
+      6. Evaluate on held-out test set.
       7. Save model + test predictions.
 
     Args:
-        data_path: Path to training_data.parquet.
+        data_path:     Path to training_data.parquet.
+        goes_era_only: If True, restrict training to 2018-2022 and test on 2023
+                       (the only window where GOES-16 features have real signal).
 
     Returns:
         The fitted XGBClassifier.
     """
+    if goes_era_only:
+        logger.info(
+            f"GOES-era-only mode: train pool {GOES_ERA_TRAIN_START}–"
+            f"{GOES_ERA_TEST_YEAR - 1} | test {GOES_ERA_TEST_YEAR}"
+        )
+
     df = load_training_data(data_path)
 
-    train_df, val_df, test_df = temporal_split(df)
+    train_df, val_df, test_df = temporal_split(df, goes_era_only=goes_era_only)
 
     X_train, y_train, X_val, y_val, X_test, y_test = build_matrices(
         train_df, val_df, test_df
@@ -597,7 +630,8 @@ def train_xgboost(
     model = build_model(scale_pos_weight=spw)
     model = train_model(model, X_train, y_train, X_val, y_val)
 
-    metrics = evaluate(model, X_test, y_test, y_train)
+    era_label = str(GOES_ERA_TEST_YEAR) if goes_era_only else "2018–2023"
+    metrics = evaluate(model, X_test, y_test, y_train, era_label=era_label)
 
     y_prob_test = model.predict_proba(X_test)[:, 1]
     save_artifacts(model, test_df, y_prob_test)
@@ -620,4 +654,17 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stderr, format="{time:HH:mm:ss} | {level:<8} | {message}")
 
-    train_xgboost()
+    parser = argparse.ArgumentParser(description="Train XGBoost RI classifier")
+    parser.add_argument(
+        "--goes-era-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Restrict training to GOES-16 era: train pool 2018-2022, test on 2023. "
+            "This is the only split where GOES-16 features have real signal "
+            "(pre-2018 rows carry only imputed median values)."
+        ),
+    )
+    args = parser.parse_args()
+
+    train_xgboost(goes_era_only=args.goes_era_only)

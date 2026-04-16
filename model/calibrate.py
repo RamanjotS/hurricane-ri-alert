@@ -38,6 +38,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import pickle
 import shutil
@@ -96,6 +97,13 @@ SOURCE_PROB_COL: str = "ensemble_simple"
 
 # Reliability curve bin count (for the test-set print)
 N_BINS: int = 10
+
+# GOES-era-only calibration: holdout is 2022 (just before 2023 test), training
+# pool is restricted to storms first observed 2018-2022.
+GOES_ERA_TRAIN_START: int = 2018
+GOES_ERA_CAL_START: int = 2022
+GOES_ERA_CAL_END: int = 2022
+GOES_ERA_TEST_YEAR: int = 2023
 
 
 # ---------------------------------------------------------------------------
@@ -220,18 +228,27 @@ def _build_lstm_seqs_for_cal(
 # ---------------------------------------------------------------------------
 
 
-def build_cal_predictions() -> pd.DataFrame:
-    """Generate 2015-2017 predictions from both base models for calibration.
+def build_cal_predictions(
+    cal_start_year: int = CAL_START_YEAR,
+    cal_end_year: int = CAL_END_YEAR,
+    test_year: int = TEST_YEAR,
+    goes_era_only: bool = False,
+) -> pd.DataFrame:
+    """Generate calibration-period predictions from both base models.
 
-    Loads the full training dataset, filters to training-pool storms (first
-    observed before TEST_YEAR) and observations in [CAL_START_YEAR,
-    CAL_END_YEAR], then runs both the saved XGBoost and LSTM models in
-    inference mode.
+    Loads the full training dataset, filters to training-pool storms, and
+    runs both the saved XGBoost and LSTM models in inference mode on the
+    calibration window [cal_start_year, cal_end_year].
 
-    XGBoost predictions are straightforward (no sequence context needed).
-    LSTM predictions use the full training-pool DataFrame for 8-step context
-    but filter output to sequences whose target timestep falls in the cal
-    window.
+    In GOES-era-only mode the pool is further restricted to storms first
+    observed in [GOES_ERA_TRAIN_START, test_year) so that only GOES-era rows
+    are included (no imputed-median pre-2018 observations).
+
+    Args:
+        cal_start_year: First year of the calibration holdout window.
+        cal_end_year:   Last year of the calibration holdout window.
+        test_year:      First year of the held-out test set (pool = < test_year).
+        goes_era_only:  If True restrict pool to storms first obs >= 2018.
 
     Returns:
         DataFrame with storm_id, datetime, ri_label, xgb_proba, lstm_proba,
@@ -251,25 +268,33 @@ def build_cal_predictions() -> pd.DataFrame:
     from data.scripts.build_training_data import ALL_FEATURE_COLUMNS
 
     logger.info(
-        f"Building calibration predictions ({CAL_START_YEAR}-{CAL_END_YEAR}) ..."
+        f"Building calibration predictions ({cal_start_year}-{cal_end_year}) ..."
     )
 
     # Load training data; identify training-pool storms
     df_full = pd.read_parquet(TRAINING_DATA_PATH)
     df_full["datetime"] = pd.to_datetime(df_full["datetime"])
     storm_first_year = df_full.groupby("storm_id")["datetime"].min().dt.year
-    pool_storms = storm_first_year[storm_first_year < TEST_YEAR].index
+
+    if goes_era_only:
+        pool_storms = storm_first_year[
+            (storm_first_year >= GOES_ERA_TRAIN_START)
+            & (storm_first_year < test_year)
+        ].index
+    else:
+        pool_storms = storm_first_year[storm_first_year < test_year].index
+
     df_pool = df_full[df_full["storm_id"].isin(pool_storms)].copy()
     logger.info(
         f"  Training pool: {len(df_pool):,} rows | {df_pool['storm_id'].nunique():,} storms"
     )
 
-    # ---- XGBoost predictions on 2015-2017 rows ----
-    logger.info("  Running XGBoost on 2015-2017 rows ...")
+    # ---- XGBoost predictions on cal-window rows ----
+    logger.info(f"  Running XGBoost on {cal_start_year}-{cal_end_year} rows ...")
     with open(XGB_MODEL_PATH, "rb") as fh:
         xgb_model = pickle.load(fh)
 
-    cal_year_mask = df_pool["datetime"].dt.year.between(CAL_START_YEAR, CAL_END_YEAR)
+    cal_year_mask = df_pool["datetime"].dt.year.between(cal_start_year, cal_end_year)
     df_cal_rows = df_pool[cal_year_mask].reset_index(drop=True)
     logger.info(
         f"  Cal rows: {len(df_cal_rows):,} | "
@@ -287,8 +312,10 @@ def build_cal_predictions() -> pd.DataFrame:
     })
     logger.info(f"  XGBoost cal rows: {len(df_xgb_cal):,}")
 
-    # ---- LSTM predictions on sequences targeting 2015-2017 ----
-    logger.info("  Running LSTM on 2015-2017 target sequences ...")
+    # ---- LSTM predictions on sequences targeting the cal window ----
+    logger.info(
+        f"  Running LSTM on {cal_start_year}-{cal_end_year} target sequences ..."
+    )
     ckpt = torch.load(LSTM_MODEL_PATH, map_location="cpu", weights_only=False)
     feature_cols = ckpt["feature_cols"]
     seq_len      = ckpt["seq_len"]
@@ -306,7 +333,9 @@ def build_cal_predictions() -> pd.DataFrame:
     lstm_model.eval()
 
     X_lstm, y_lstm, meta_lstm = _build_lstm_seqs_for_cal(
-        df_pool, feature_cols, seq_len
+        df_pool, feature_cols, seq_len,
+        cal_start=cal_start_year,
+        cal_end=cal_end_year,
     )
     logger.info(
         f"  LSTM cal sequences: {len(X_lstm):,} | "
@@ -325,7 +354,6 @@ def build_cal_predictions() -> pd.DataFrame:
     logger.info(f"  LSTM cal rows: {len(df_lstm_cal):,}")
 
     # ---- Inner join ----
-    # Strip timezone before merge if present
     for d in (df_xgb_cal, df_lstm_cal):
         d["datetime"] = pd.to_datetime(d["datetime"])
         if d["datetime"].dt.tz is not None:
@@ -454,13 +482,17 @@ def tune_threshold(
     y_true: np.ndarray,
     cal_probs: np.ndarray,
     sweep: np.ndarray = THRESHOLD_SWEEP,
+    cal_start_year: int = CAL_START_YEAR,
+    cal_end_year: int = CAL_END_YEAR,
 ) -> tuple[float, float, pd.DataFrame]:
     """Find F1-optimal alert threshold on calibrated probabilities.
 
     Args:
-        y_true:    True binary labels.
-        cal_probs: Calibrated probabilities (OOF within cal set).
-        sweep:     Threshold candidates.
+        y_true:          True binary labels.
+        cal_probs:       Calibrated probabilities (OOF within cal set).
+        sweep:           Threshold candidates.
+        cal_start_year:  First year of the calibration holdout (for log).
+        cal_end_year:    Last year of the calibration holdout (for log).
 
     Returns:
         (best_threshold, best_f1, sweep_df sorted by f1 desc).
@@ -484,25 +516,42 @@ def tune_threshold(
     best = sweep_df.iloc[0]
     best_threshold, best_f1 = float(best["threshold"]), float(best["f1"])
 
+    cal_label = (
+        str(cal_start_year)
+        if cal_start_year == cal_end_year
+        else f"{cal_start_year}-{cal_end_year}"
+    )
     logger.info(
         f"Threshold sweep complete — optimal: {best_threshold:.2f}  "
         f"F1={best_f1:.4f}  POD={best['pod']:.3f}  FAR={best['far']:.3f}  "
-        f"(tuned on {CAL_START_YEAR}-{CAL_END_YEAR} OOF cal probs)"
+        f"(tuned on {cal_label} OOF cal probs)"
     )
     return best_threshold, best_f1, sweep_df
 
 
-def print_threshold_sweep(sweep_df: pd.DataFrame, top_n: int = 15) -> None:
+def print_threshold_sweep(
+    sweep_df: pd.DataFrame,
+    top_n: int = 15,
+    cal_start_year: int = CAL_START_YEAR,
+    cal_end_year: int = CAL_END_YEAR,
+) -> None:
     """Print top-N threshold candidates ranked by F1.
 
     Args:
-        sweep_df: Returned by tune_threshold (sorted by F1 desc).
-        top_n:    Number of rows to display.
+        sweep_df:       Returned by tune_threshold (sorted by F1 desc).
+        top_n:          Number of rows to display.
+        cal_start_year: First year of the calibration holdout (for header).
+        cal_end_year:   Last year of the calibration holdout (for header).
     """
+    cal_label = (
+        str(cal_start_year)
+        if cal_start_year == cal_end_year
+        else f"{cal_start_year}-{cal_end_year}"
+    )
     print()
     print("=" * 72)
     print(
-        f"  Threshold Sweep — F1-Optimal (tuned on {CAL_START_YEAR}-{CAL_END_YEAR} "
+        f"  Threshold Sweep — F1-Optimal (tuned on {cal_label} "
         f"OOF cal probs, NOT test set)"
     )
     print(f"  Showing top {top_n} of {len(sweep_df)} candidates")
@@ -597,17 +646,29 @@ def print_calibration_summary(
     y_cal: np.ndarray,
     y_stacked_cal: np.ndarray,
     clim_rate: float,
+    cal_start_year: int = CAL_START_YEAR,
+    cal_end_year: int = CAL_END_YEAR,
+    test_year: int = TEST_YEAR,
 ) -> None:
     """Print AUC, Brier Score, BSS for raw, calibrated, and stacked-cal variants.
 
     Args:
-        y_true:        True binary labels (test set).
-        y_raw:         Raw simple-avg probabilities (test set).
-        y_cal:         Holdout-calibrated simple-avg probabilities (test set).
-        y_stacked_cal: Holdout-calibrated stacked probabilities (test set).
-        clim_rate:     RI climatological rate (from test set).
+        y_true:         True binary labels (test set).
+        y_raw:          Raw simple-avg probabilities (test set).
+        y_cal:          Holdout-calibrated simple-avg probabilities (test set).
+        y_stacked_cal:  Holdout-calibrated stacked probabilities (test set).
+        clim_rate:      RI climatological rate (from test set).
+        cal_start_year: First year of the calibration holdout (for header).
+        cal_end_year:   Last year of the calibration holdout (for header).
+        test_year:      First year of the test set (for header).
     """
     bs_clim = float(np.mean((clim_rate - y_true) ** 2))
+
+    cal_label = (
+        str(cal_start_year)
+        if cal_start_year == cal_end_year
+        else f"{cal_start_year}-{cal_end_year}"
+    )
 
     def _row(label: str, probs: np.ndarray) -> None:
         auc = roc_auc_score(y_true, probs)
@@ -617,8 +678,8 @@ def print_calibration_summary(
 
     print()
     print("=" * 72)
-    print("  Calibration Summary (2018-2023 test set)")
-    print(f"  Calibrator + stacker both trained on {CAL_START_YEAR}-{CAL_END_YEAR} holdout")
+    print(f"  Calibration Summary ({test_year} test set)")
+    print(f"  Calibrator + stacker both trained on {cal_label} holdout")
     print("=" * 72)
     _row("Raw ensemble (simple avg)", y_raw)
     _row("Holdout-calibrated simple avg", y_cal)
@@ -645,6 +706,8 @@ def save_artifacts(
     calibrator_stacked: IsotonicRegression,
     threshold: float,
     threshold_metrics: dict,
+    cal_start_year: int = CAL_START_YEAR,
+    cal_end_year: int = CAL_END_YEAR,
 ) -> None:
     """Persist all calibration artifacts and the updated predictions parquet.
 
@@ -664,6 +727,8 @@ def save_artifacts(
         calibrator_stacked: Fitted IsotonicRegression (stacked).
         threshold:          F1-optimal alert threshold.
         threshold_metrics:  Dict with f1, pod, far, tp, fp, fn at threshold.
+        cal_start_year:     First year of the calibration holdout (for JSON).
+        cal_end_year:       Last year of the calibration holdout (for JSON).
     """
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -691,6 +756,11 @@ def save_artifacts(
     _save_pkl(calibrator_stacked,  "calibrator_stacked")
 
     # Optimal threshold JSON
+    cal_label = (
+        str(cal_start_year)
+        if cal_start_year == cal_end_year
+        else f"{cal_start_year}-{cal_end_year}"
+    )
     record = {
         "threshold": threshold,
         "f1":  threshold_metrics["f1"],
@@ -700,7 +770,7 @@ def save_artifacts(
         "fp":  threshold_metrics["fp"],
         "fn":  threshold_metrics["fn"],
         "source": (
-            f"F1-optimal sweep on {CAL_START_YEAR}-{CAL_END_YEAR} "
+            f"F1-optimal sweep on {cal_label} "
             "OOF calibrated probabilities (holdout split)"
         ),
     }
@@ -748,25 +818,56 @@ def load_ensemble_preds(path: Path = ENSEMBLE_PREDS_PATH) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def run_calibration() -> pd.DataFrame:
+def run_calibration(goes_era_only: bool = False) -> pd.DataFrame:
     """Run the full holdout-calibration and threshold-tuning pipeline.
 
     Steps:
-      1. Build 2015-2017 calibration-set predictions (both base models).
-      2. Load 2018-2023 test predictions from ensemble_test_preds.parquet.
-      3. Fit calibrator_simple, stacker, calibrator_stacked on 2015-2017.
-      4. Run 5-fold OOF within 2015-2017 for unbiased threshold tuning.
-      5. Sweep thresholds; pick F1-optimal on 2015-2017 OOF probs.
-      6. Apply calibrators to 2018-2023 test set.
+      1. Build calibration-set predictions from both base models.
+      2. Load test predictions from ensemble_test_preds.parquet.
+      3. Fit calibrator_simple, stacker, calibrator_stacked on holdout set.
+      4. Run 5-fold OOF within holdout set for unbiased threshold tuning.
+      5. Sweep thresholds; pick F1-optimal on OOF probs.
+      6. Apply calibrators to test set.
       7. Print threshold sweep, reliability curve, calibration summary.
       8. Save all artifacts.
 
+    Args:
+        goes_era_only: If True use 2022 as the calibration holdout year and
+                       restrict the pool to GOES-era storms (2018-2022).
+                       This matches the GOES-era training splits used in
+                       train_xgboost.py --goes-era-only and
+                       train_lstm.py --goes-era-only.
+
     Returns:
-        DataFrame (2018-2023 test set) with calibrated_proba and
-        stacked_cal_proba columns added.
+        DataFrame (test set) with calibrated_proba and stacked_cal_proba added.
     """
+    # Resolve year parameters
+    if goes_era_only:
+        cal_start_year = GOES_ERA_CAL_START
+        cal_end_year   = GOES_ERA_CAL_END
+        cal_test_year  = GOES_ERA_TEST_YEAR
+        logger.info(
+            f"GOES-era-only calibration: holdout={cal_start_year} | "
+            f"test={cal_test_year}"
+        )
+    else:
+        cal_start_year = CAL_START_YEAR
+        cal_end_year   = CAL_END_YEAR
+        cal_test_year  = TEST_YEAR
+
+    cal_label = (
+        str(cal_start_year)
+        if cal_start_year == cal_end_year
+        else f"{cal_start_year}-{cal_end_year}"
+    )
+
     # Step 1 & 2
-    cal_df  = build_cal_predictions()
+    cal_df  = build_cal_predictions(
+        cal_start_year=cal_start_year,
+        cal_end_year=cal_end_year,
+        test_year=cal_test_year,
+        goes_era_only=goes_era_only,
+    )
     test_df = load_ensemble_preds()
 
     y_test_true = test_df["ri_label"].to_numpy(dtype=np.int8)
@@ -774,7 +875,7 @@ def run_calibration() -> pd.DataFrame:
     clim_rate   = float(y_test_true.mean())
 
     # Step 3 & 4
-    logger.info("Fitting calibration artifacts on holdout set ...")
+    logger.info(f"Fitting calibration artifacts on {cal_label} holdout set ...")
     (
         test_cal_proba,
         test_stacked_cal,
@@ -787,16 +888,27 @@ def run_calibration() -> pd.DataFrame:
 
     # Step 5
     logger.info(
-        f"Tuning alert threshold on {CAL_START_YEAR}-{CAL_END_YEAR} OOF probs "
+        f"Tuning alert threshold on {cal_label} OOF probs "
         f"(sweep: {THRESHOLD_SWEEP[0]:.2f} -> {THRESHOLD_SWEEP[-1]:.2f}) ..."
     )
-    best_thr, best_f1, sweep_df = tune_threshold(cal_y, cal_oof_simple)
+    best_thr, best_f1, sweep_df = tune_threshold(
+        cal_y, cal_oof_simple,
+        cal_start_year=cal_start_year,
+        cal_end_year=cal_end_year,
+    )
 
     # Step 7 — print reports
-    print_threshold_sweep(sweep_df)
+    print_threshold_sweep(
+        sweep_df,
+        cal_start_year=cal_start_year,
+        cal_end_year=cal_end_year,
+    )
     print_reliability_curve(y_test_true, y_test_raw, test_cal_proba)
     print_calibration_summary(
-        y_test_true, y_test_raw, test_cal_proba, test_stacked_cal, clim_rate
+        y_test_true, y_test_raw, test_cal_proba, test_stacked_cal, clim_rate,
+        cal_start_year=cal_start_year,
+        cal_end_year=cal_end_year,
+        test_year=cal_test_year,
     )
 
     # Step 8
@@ -810,6 +922,8 @@ def run_calibration() -> pd.DataFrame:
         calibrator_stacked,
         best_thr,
         best_row,
+        cal_start_year=cal_start_year,
+        cal_end_year=cal_end_year,
     )
 
     test_df = test_df.copy()
@@ -826,4 +940,16 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stderr, format="{time:HH:mm:ss} | {level:<8} | {message}")
 
-    run_calibration()
+    parser = argparse.ArgumentParser(description="Calibrate RI ensemble probabilities")
+    parser.add_argument(
+        "--goes-era-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Use 2022 as the calibration holdout year (matching the "
+            "--goes-era-only training split where train=2018-2022, test=2023)."
+        ),
+    )
+    args = parser.parse_args()
+
+    run_calibration(goes_era_only=args.goes_era_only)

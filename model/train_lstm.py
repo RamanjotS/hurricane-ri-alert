@@ -31,6 +31,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import pickle
 import shutil
 import sys
@@ -79,6 +80,11 @@ SEQ_LEN: int = 8
 # Temporal split year (same as XGBoost)
 TEST_YEAR: int = 2018
 VAL_FRAC: float = 0.15
+
+# GOES-era-only mode: restrict training to storms first observed in
+# [GOES_ERA_TRAIN_START, GOES_ERA_TEST_YEAR) and test on GOES_ERA_TEST_YEAR+
+GOES_ERA_TRAIN_START: int = 2018
+GOES_ERA_TEST_YEAR: int = 2023
 
 # Training hyperparameters
 BATCH_SIZE: int = 512
@@ -183,20 +189,35 @@ def temporal_split(
     df: pd.DataFrame,
     test_year: int = TEST_YEAR,
     val_frac: float = VAL_FRAC,
+    goes_era_only: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Temporal train/val/test split identical to train_xgboost.py.
 
+    When goes_era_only=True the pool is restricted to storms first observed in
+    [GOES_ERA_TRAIN_START, GOES_ERA_TEST_YEAR) and the test set is storms first
+    observed >= GOES_ERA_TEST_YEAR.
+
     Args:
-        df:        Full DataFrame.
-        test_year: First year of test window.
-        val_frac:  Fraction of training pool rows reserved for validation.
+        df:             Full DataFrame.
+        test_year:      First year of test window (ignored when goes_era_only=True).
+        val_frac:       Fraction of training pool rows reserved for validation.
+        goes_era_only:  If True, restrict to GOES-16 operational era (2018+).
 
     Returns:
         Tuple of (train_df, val_df, test_df).
     """
     storm_first_year = df.groupby("storm_id")["datetime"].min().dt.year
-    train_pool_storms = storm_first_year[storm_first_year < test_year].index
-    test_storms = storm_first_year[storm_first_year >= test_year].index
+    if goes_era_only:
+        train_pool_storms = storm_first_year[
+            (storm_first_year >= GOES_ERA_TRAIN_START)
+            & (storm_first_year < GOES_ERA_TEST_YEAR)
+        ].index
+        test_storms = storm_first_year[
+            storm_first_year >= GOES_ERA_TEST_YEAR
+        ].index
+    else:
+        train_pool_storms = storm_first_year[storm_first_year < test_year].index
+        test_storms = storm_first_year[storm_first_year >= test_year].index
 
     train_pool = df[df["storm_id"].isin(train_pool_storms)].copy()
     test_df = df[df["storm_id"].isin(test_storms)].copy()
@@ -619,6 +640,7 @@ def save_artifacts(
 def train_lstm(
     training_path: Path = TRAINING_DATA_PATH,
     goes_path: Path = GOES16_FEATURES_PATH,
+    goes_era_only: bool = False,
 ) -> RILSTMModel:
     """Run the full LSTM training pipeline end-to-end.
 
@@ -633,6 +655,7 @@ def train_lstm(
     Args:
         training_path: Path to training_data.parquet.
         goes_path:     Path to goes16_features.parquet.
+        goes_era_only: If True, restrict training to 2018-2022 and test on 2023.
 
     Returns:
         Trained RILSTMModel.
@@ -640,10 +663,16 @@ def train_lstm(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
+    if goes_era_only:
+        logger.info(
+            f"GOES-era-only mode: train pool {GOES_ERA_TRAIN_START}–"
+            f"{GOES_ERA_TEST_YEAR - 1} | test {GOES_ERA_TEST_YEAR}"
+        )
+
     df, feature_cols = load_and_join(training_path, goes_path)
     n_features = len(feature_cols)
 
-    train_df, val_df, test_df = temporal_split(df)
+    train_df, val_df, test_df = temporal_split(df, goes_era_only=goes_era_only)
 
     logger.info("Building training sequences …")
     X_train, y_train, _ = build_sequences(train_df, feature_cols)
@@ -687,4 +716,17 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stderr, format="{time:HH:mm:ss} | {level:<8} | {message}")
 
-    train_lstm()
+    parser = argparse.ArgumentParser(description="Train LSTM RI classifier")
+    parser.add_argument(
+        "--goes-era-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Restrict training to GOES-16 era: train pool 2018-2022, test on 2023. "
+            "This is the only split where GOES-16 features have real signal "
+            "(pre-2018 rows carry only imputed median values)."
+        ),
+    )
+    args = parser.parse_args()
+
+    train_lstm(goes_era_only=args.goes_era_only)

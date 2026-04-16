@@ -214,20 +214,22 @@ def print_comparison(
     y_true: np.ndarray,
     scores: dict[str, np.ndarray],
     clim_rate: float,
+    year_label: str = "2018–2023",
 ) -> None:
     """Print a comparison table of AUC and BSS for all scored variants.
 
     Args:
-        y_true:    True binary labels.
-        scores:    Dict mapping label → probability array.
-        clim_rate: Training-set RI rate for BSS baseline.
+        y_true:     True binary labels.
+        scores:     Dict mapping label → probability array.
+        clim_rate:  Training-set RI rate for BSS baseline.
+        year_label: Year range string derived from the loaded predictions.
     """
     bench = SHIPS_RII_BENCHMARKS
     w = 70
 
     print()
     print("=" * w)
-    print("  Ensemble Comparison — Test Set (2018–2023)")
+    print(f"  Ensemble Comparison — Test Set ({year_label})")
     print("=" * w)
     print(f"  {'Model':<28}  {'AUC':>8}  {'BSS':>8}  {'vs SHIPS-RII':>14}")
     print(f"  {'-'*28}  {'-'*8}  {'-'*8}  {'-'*14}")
@@ -310,6 +312,11 @@ def run_ensemble() -> pd.DataFrame:
     y_true = df["ri_label"].to_numpy(dtype=np.int8)
     clim_rate = float(y_true.mean())
 
+    # Derive year label from the data
+    years = pd.to_datetime(df["datetime"]).dt.year
+    yr_min, yr_max = int(years.min()), int(years.max())
+    year_label = str(yr_min) if yr_min == yr_max else f"{yr_min}–{yr_max}"
+
     # Simple average
     p_simple = simple_average(df).to_numpy()
 
@@ -324,7 +331,7 @@ def run_ensemble() -> pd.DataFrame:
         "Simple average (0.5/0.5)": p_simple,
         "Stacked (logistic)": p_stacked,
     }
-    print_comparison(y_true, scores, clim_rate)
+    print_comparison(y_true, scores, clim_rate, year_label=year_label)
 
     save_outputs(df, p_simple, p_stacked, stacker)
     return df

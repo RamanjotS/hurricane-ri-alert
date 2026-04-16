@@ -305,15 +305,17 @@ def print_headline_metrics(
     clim_rate: float,
     threshold: float,
     label: str = "Calibrated ensemble",
+    year_label: str = "2018–2023",
 ) -> dict[str, float]:
     """Print headline AUC, BSS, POD, FAR and return as dict.
 
     Args:
-        y_true:    True binary labels.
-        y_prob:    Predicted probabilities.
-        clim_rate: RI climatological base rate.
-        threshold: Alert probability threshold (F1-optimal from calibrate.py).
-        label:     Display name for the model variant.
+        y_true:     True binary labels.
+        y_prob:     Predicted probabilities.
+        clim_rate:  RI climatological base rate.
+        threshold:  Alert probability threshold (F1-optimal from calibrate.py).
+        label:      Display name for the model variant.
+        year_label: Year range string shown in the report header.
 
     Returns:
         Dict with keys: auc, bss, pod, far, bs.
@@ -329,7 +331,7 @@ def print_headline_metrics(
     print()
     print("=" * w)
     print(f"  {label}")
-    print(f"  Test Set: 2018-2023  |  Alert threshold: {threshold:.2f} (F1-optimal)")
+    print(f"  Test Set: {year_label}  |  Alert threshold: {threshold:.2f} (F1-optimal)")
     print("=" * w)
     print(f"  {'Metric':<30}  {'Model':>8}  {'SHIPS-RII':>9}  {'Target':>8}  {'Status':>8}")
     print(f"  {'-'*30}  {'-'*8}  {'-'*9}  {'-'*8}  {'-'*8}")
@@ -469,6 +471,7 @@ def print_model_comparison(
     df: pd.DataFrame,
     clim_rate: float,
     threshold: float,
+    year_label: str = "2018–2023",
 ) -> None:
     """Print AUC, BSS, POD, FAR for all available model variants side-by-side.
 
@@ -476,6 +479,7 @@ def print_model_comparison(
         df:         Calibrated predictions DataFrame.
         clim_rate:  RI climatological base rate.
         threshold:  F1-optimal alert threshold.
+        year_label: Year range string shown in the report header.
     """
     y_true = df["ri_label"].to_numpy(dtype=np.int8)
     bs_clim = float(np.mean((clim_rate - y_true) ** 2))
@@ -492,7 +496,7 @@ def print_model_comparison(
     w = 66
     print()
     print("=" * w)
-    print(f"  Full Model Comparison -- Test Set 2018-2023  (thr={threshold:.2f})")
+    print(f"  Full Model Comparison -- Test Set {year_label}  (thr={threshold:.2f})")
     print("=" * w)
     print(f"  {'Variant':<30}  {'AUC':>8}  {'BSS':>8}  {'POD':>6}  {'FAR':>6}")
     print(f"  {'-'*30}  {'-'*8}  {'-'*8}  {'-'*6}  {'-'*6}")
@@ -544,11 +548,18 @@ def run_evaluation(path: Path = CALIBRATED_PREDS_PATH) -> dict[str, float]:
     y_cal = df["calibrated_proba"].to_numpy(dtype=np.float32)
     clim_rate = float(y_true.mean())
 
+    # Derive year range from the data so the report header is always accurate
+    years = pd.to_datetime(df["datetime"]).dt.year
+    yr_min, yr_max = int(years.min()), int(years.max())
+    year_label = str(yr_min) if yr_min == yr_max else f"{yr_min}–{yr_max}"
+
     print_reliability_diagram(y_true, y_cal)
-    metrics = print_headline_metrics(y_true, y_cal, clim_rate, threshold)
+    metrics = print_headline_metrics(
+        y_true, y_cal, clim_rate, threshold, year_label=year_label
+    )
     print_per_year_breakdown(df, threshold)
     print_per_storm_summary(df)
-    print_model_comparison(df, clim_rate, threshold)
+    print_model_comparison(df, clim_rate, threshold, year_label=year_label)
 
     return metrics
 
