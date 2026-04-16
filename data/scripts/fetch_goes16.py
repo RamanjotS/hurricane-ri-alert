@@ -38,6 +38,7 @@ import multiprocessing as mp
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -321,7 +322,7 @@ def cache_granule(
     fs: s3fs.S3FileSystem,
     s3_key: str,
     cache_dir: Path,
-) -> Path:
+) -> tuple[Path, bool]:
     """Download a GOES-16 granule to the local cache, if not already present.
 
     Mirrors the S3 path structure under *cache_dir*.  Writes atomically via
@@ -333,14 +334,15 @@ def cache_granule(
         cache_dir: Root cache directory.
 
     Returns:
-        Local path to the cached .nc file.
+        (local_path, was_downloaded) — was_downloaded is True only when a
+        fresh network download occurred; False means the file was already cached.
     """
     relative = s3_key.removeprefix(f"{S3_BUCKET}/")
     local_path = cache_dir / relative
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     if local_path.exists():
-        return local_path
+        return local_path, False  # cache hit — no download needed
 
     logger.debug(f"Downloading {s3_key.split('/')[-1]} …")
     tmp_path: Path | None = None
@@ -359,7 +361,7 @@ def cache_granule(
             tmp_path.unlink(missing_ok=True)
         raise
 
-    return local_path
+    return local_path, True  # freshly downloaded
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +551,9 @@ def _process_one(item: _WorkItem) -> dict:
         item: Work item with storm metadata.
 
     Returns:
-        Dict with storm_id, datetime, GOES_FEATURE_COLUMNS, and goes_coverage.
+        Dict with storm_id, datetime, GOES_FEATURE_COLUMNS, goes_coverage,
+        plus private tracking keys _status, _was_downloaded, _file_bytes
+        (stripped by the parent before storing rows).
     """
     nan_features = {col: float("nan") for col in GOES_FEATURE_COLUMNS}
     base = {
@@ -557,6 +561,10 @@ def _process_one(item: _WorkItem) -> dict:
         "datetime": item.datetime_utc,
         **nan_features,
         "goes_coverage": float("nan"),
+        # private tracking fields — stripped in build_goes16_features
+        "_status": "fail",
+        "_was_downloaded": False,
+        "_file_bytes": 0,
     }
 
     dt: datetime = item.datetime_utc.to_pydatetime()
@@ -571,10 +579,13 @@ def _process_one(item: _WorkItem) -> dict:
         return base
 
     if s3_key is None:
+        base["_status"] = "no_granule"
         return base  # no scan within ±30 min
 
     try:
-        local_path = cache_granule(fs, s3_key, item.cache_dir)
+        local_path, was_downloaded = cache_granule(fs, s3_key, item.cache_dir)
+        base["_was_downloaded"] = was_downloaded
+        base["_file_bytes"] = local_path.stat().st_size
     except Exception as exc:
         logger.warning(
             f"[{item.storm_id}/{dt.date()}] Download failed "
@@ -583,6 +594,10 @@ def _process_one(item: _WorkItem) -> dict:
         return base
 
     features = extract_bt_features(local_path, item.lat, item.lon)
+    if not np.isnan(features.get("goes_coverage", float("nan"))):
+        base["_status"] = "success"
+    else:
+        base["_status"] = "extract_fail"
     return {**base, **features}
 
 
@@ -678,6 +693,36 @@ def build_goes16_features(
     )
 
     goes_records: list[dict] = []
+
+    # Progress tracking counters
+    _n_success    = 0
+    _n_skip       = 0   # cache hits (no download needed)
+    _n_no_granule = 0   # no GOES scan within ±30 min window
+    _n_fail       = 0   # download or extraction errors
+    _bytes_dl     = 0   # bytes freshly downloaded
+    _t0           = time.perf_counter()
+
+    _PROGRESS_INTERVAL = 50  # log every N completed work items
+    _total = len(work_items)
+
+    def _log_progress(i: int) -> None:
+        elapsed = time.perf_counter() - _t0
+        rate    = i / elapsed if elapsed > 0 else 0.0
+        eta_sec = (_total - i) / rate if rate > 0 else 0.0
+        eta_str = (
+            f"{eta_sec / 3600:.1f} h"
+            if eta_sec >= 3600
+            else f"{eta_sec / 60:.0f} min"
+        )
+        gb_done = _bytes_dl / 1e9
+        logger.info(
+            f"  [{i:,}/{_total:,}]  "
+            f"done={i}  remaining={_total - i}  "
+            f"downloaded={gb_done:.2f} GB  ETA={eta_str}  |  "
+            f"success={_n_success}  skip={_n_skip}  "
+            f"no_granule={_n_no_granule}  fail={_n_fail}"
+        )
+
     if n_workers > 1:
         ctx = mp.get_context("spawn")
         with ctx.Pool(processes=n_workers) as pool:
@@ -685,14 +730,47 @@ def build_goes16_features(
                 pool.imap_unordered(_process_one, work_items, chunksize=4),
                 start=1,
             ):
+                status        = result.pop("_status", "fail")
+                was_dl        = result.pop("_was_downloaded", False)
+                file_bytes    = result.pop("_file_bytes", 0)
+
+                if status == "success":
+                    _n_success += 1
+                elif status == "no_granule":
+                    _n_no_granule += 1
+                else:
+                    _n_fail += 1
+
+                if was_dl:
+                    _bytes_dl += file_bytes
+                else:
+                    _n_skip += 1
+
                 goes_records.append(result)
-                if i % 200 == 0 or i == len(work_items):
-                    logger.info(f"  Progress: {i:,} / {len(work_items):,}")
+                if i % _PROGRESS_INTERVAL == 0 or i == _total:
+                    _log_progress(i)
     else:
         for i, item in enumerate(work_items, start=1):
-            goes_records.append(_process_one(item))
-            if i % 200 == 0 or i == len(work_items):
-                logger.info(f"  Progress: {i:,} / {len(work_items):,}")
+            result        = _process_one(item)
+            status        = result.pop("_status", "fail")
+            was_dl        = result.pop("_was_downloaded", False)
+            file_bytes    = result.pop("_file_bytes", 0)
+
+            if status == "success":
+                _n_success += 1
+            elif status == "no_granule":
+                _n_no_granule += 1
+            else:
+                _n_fail += 1
+
+            if was_dl:
+                _bytes_dl += file_bytes
+            else:
+                _n_skip += 1
+
+            goes_records.append(result)
+            if i % _PROGRESS_INTERVAL == 0 or i == _total:
+                _log_progress(i)
 
     # Combine and enforce dtypes
     df_out = pd.DataFrame(pre_goes_records + goes_records)
